@@ -1,9 +1,13 @@
+import argparse
 import datetime
+import json
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional
 
 import requests
+import dotenv
 
 
 GITHUB_API = "https://api.github.com"
@@ -210,3 +214,64 @@ def build_raw_record(issue: Dict[str, Any], comments: List[Dict[str, Any]], quer
         # 轻度抽取：方便你后续 build_messages 阶段更快定位报错
         "error_blocks": extract_error_blocks(body + "\n\n" + comments_text),
     }
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True, help="输出 raw JSONL 文件路径")
+    ap.add_argument("--max-items-per-query", type=int, default=300, help="每个 query 抓取 issue 数上限")
+    ap.add_argument("--max-comments", type=int, default=50, help="每个 issue 抓取评论数上限")
+    ap.add_argument("--query", action="append", help="额外增加 search query（可重复传入）")
+    ap.add_argument("--no-default-queries", action="store_true", help="不使用内置默认 queries")
+    args = ap.parse_args()
+
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print("[warn] 未检测到 GITHUB_TOKEN（强烈建议设置，否则很快限流）")
+
+    session = build_session(token)
+
+    queries: List[str] = []
+    if not args.no_default_queries:
+        queries.extend(DEFAULT_QUERIES)
+    if args.query:
+        queries.extend(args.query)
+    if not queries:
+        raise SystemExit("没有任何 query。请使用默认 queries 或 --query 添加。")
+
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+
+    seen_issue_ids = set()
+    total = 0
+
+    with open(args.out, "w", encoding="utf-8") as f:
+        for q in queries:
+            print(f"\n[search] {q}")
+            issues = search_issues(session, q, max_items=args.max_items_per_query)
+            print(f"[search] got {len(issues)} issues")
+
+            for it in issues:
+                iid = it.get("id")
+                if not iid or iid in seen_issue_ids:
+                    continue
+                seen_issue_ids.add(iid)
+
+                comments: List[Dict[str, Any]] = []
+                try:
+                    if (it.get("comments") or 0) > 0:
+                        comments = fetch_comments(session, it.get("comments_url"), max_comments=args.max_comments)
+                except Exception as e:
+                    print(f"[warn] comments fetch failed: {it.get('html_url')} err={e}")
+
+                rec = build_raw_record(it, comments, query=q)
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                total += 1
+
+                if total % 50 == 0:
+                    print(f"[progress] wrote {total} records...")
+
+                time.sleep(0.2)
+
+    print(f"\n[done] wrote {total} records to {args.out}")
+
+if __name__ == "__main__":
+    main()
